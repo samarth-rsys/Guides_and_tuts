@@ -1,0 +1,1004 @@
+# REST Call Handling: Diagnosis Actor vs Command Actor
+
+> **Who is this for?** Someone new to this codebase who wants to understand how a simple HTTP POST request travels all the way through the system and triggers real device operations.
+
+---
+
+## 🧱 Background: What is an "Actor"?
+
+Think of an **actor** as a microservice that:
+1. **Listens** on a message bus (NATS or Kafka) for specific event types
+2. **Does some work** (calls a Juniper switch, looks up inventory, etc.)
+3. **Publishes a response** back onto the message bus
+
+There are two actors involved here:
+- **Diagnosis Actor** — handles diagnostics AND some device operations. It supports read-only checks (interface counters, BGP state, ping, transceiver info) **as well as** device writes like `NeRebootRequest` (actual reboot). The key characteristic is it **fires and returns immediately** — it triggers the operation and reports success/failure without monitoring the outcome.
+- **Command Actor** — handles device operations with **active monitoring**. For example, after triggering a reboot, it keeps pinging the device to confirm it shut down and came back up, producing progress events throughout.
+
+Both actors expose an HTTP server, primarily for Kubernetes health probes (`/healthz`, `/readyz`).  
+We added a **REST endpoint** to each so that a human (or another service) can trigger operations directly via HTTP.
+
+---
+
+## 📬 The Two REST Endpoints
+
+| Actor | Endpoint | File |
+|---|---|---|
+| Diagnosis | `POST /diagnoses` | `pkg/resources/diagnoses.go` |
+| Command | `POST /commands` | `pkg/resources/commands.go` |
+
+---
+
+## 🔬 Diagnosis Actor — How `POST /diagnoses` Works
+
+### 1. The Request
+
+```
+POST http://localhost:9080/diagnoses
+Content-Type: application/json
+
+{
+  "diagnosisType": "io.leitstand.actor.events.diagnosis.NeRebootRequest",
+  "diagnosisParameters": {
+    "resourceId": "91000000-0080-0000-0103-000000000000"
+  },
+  "metadata": {
+    "sourceObjectIdentifier": "91000000-0080-0000-0103-000000000000",
+    "sourceObjectClass": "NetworkElement",
+    "sourceObjectType": "A4-SPINE-Switch-v2"
+  }
+}
+```
+
+**Three parts in every request:**
+- `diagnosisType` → Which operation to run (like a function name)
+- `diagnosisParameters` → Arguments to that operation (like function arguments)
+- `metadata` → Who/what this operation is about (the network element)
+
+---
+
+### 2. Step-by-Step Flow
+
+```
+Browser/curl
+    │
+    │  POST /diagnoses (JSON body)
+    ▼
+[cmd/actors/diagnosis/main.go]
+    │  startService() mounts the router at "/"
+    │  → mux.Handle("/", diagnosisRouter)
+    ▼
+[pkg/resources/diagnoses.go]  runDiagnosis()
+    │
+    ├─ Step 1: Deserialize JSON body into a "request" struct
+    │           diagnosisType      = "...NeRebootRequest"
+    │           diagnosisParameters = {"resourceId": "..."}
+    │           metadata            = {sourceObjectIdentifier, ...}
+    │
+    ├─ Step 2: Look up the "diagnosisType" in the schema registry
+    │           → finds the Go struct that matches this type name
+    │           → gets a deserializer function for it
+    │
+    ├─ Step 3: Deserialize diagnosisParameters into typed Go struct
+    │           {"resourceId": "..."} → NeRebootRequest{ResourceId: "..."}
+    │
+    ├─ Step 4: Set up two callbacks (functions to call later)
+    │           sendDiagnosis() → writes success response to HTTP client
+    │           sendError()     → writes error/timeout response to HTTP client
+    │
+    ├─ Step 5: Call newEmit() to publish to NATS message bus
+    │           Subject: "diagnosis-validated-requests"
+    │           Wraps the payload in a DiagnosisRequest envelope (Avro binary)
+    │           Sets metadata fields on the event
+    │
+    ├─ Step 6: Wait (up to 60 seconds) for a response
+    │           select {
+    │             case <-done:           → callback was called, response sent
+    │             case <-time.After(60s):→ timeout, connection closes
+    │           }
+    │
+    │  [Meanwhile, on the NATS message bus...]
+    ▼
+[pkg/fixtures/diagnosis/diagnosis.go]  Pipeline
+    │  Listening on "diagnosis-validated-requests"
+    │  Matches message type → routes to commands.RebootDevice()
+    ▼
+[pkg/fixtures/diagnosis/ne_reboot_command.go]  RebootDevice()
+    │
+    ├─ Validate sourceObjectClass == "NetworkElement"
+    ├─ Validate sourceObjectType is a supported switch type
+    ├─ Fetch network element from inventory
+    ├─ Get management IP address
+    └─ Call switchClient.Reboot()  ← actual Juniper API call
+         │
+         └─ Returns NeRebootResponse{ReturnCode: {Code: "OK", ...}}
+    │
+    ▼
+Pipeline publishes NeRebootResponse to NATS "diagnosis-responses"
+    │
+    ▼
+newEmit() response listener receives it
+    │  Unwraps envelope → calls sendDiagnosis() callback
+    ▼
+sendDiagnosis() writes HTTP response back to caller
+    │
+    └─ 200 OK: {"id": "...", "responseData": {"rebootResult": {...}}}
+```
+
+---
+
+### 3. Key Code in `diagnoses.go`
+
+```go
+// The JSON request body shape
+type request struct {
+    DiagnosisType       string          `json:"diagnosisType"`
+    DiagnosisParameters json.RawMessage `json:"diagnosisParameters"`
+    Metadata            Metadata        `json:"metadata"`
+}
+
+// Route registration
+r.HandleFunc("/diagnoses", d.runDiagnosis)
+
+// Response shape on success
+{
+  "id": "<notification-uuid>",
+  "responseData": { ...diagnosis specific fields... }
+}
+```
+
+---
+
+## ⚙️ Command Actor — How `POST /commands` Works
+
+### 1. The Request
+
+```
+POST http://localhost:9081/commands
+Content-Type: application/json
+
+{
+  "commandType": "io.leitstand.actor.events.commands.NeRebootCommandRequest",
+  "commandParameters": {
+    "resourceId": "91000000-0080-0000-0103-000000000000",
+    "rebootMode": "DEFAULT"
+  },
+  "metadata": {
+    "sourceObjectIdentifier": "91000000-0080-0000-0103-000000000000",
+    "sourceObjectClass": "NetworkElement",
+    "sourceObjectType": "A4-SPINE-Switch-v2"
+  }
+}
+```
+
+Same three-part structure, just with `commandType` and `commandParameters` instead of the `diagnosis*` equivalents.
+
+---
+
+### 2. Step-by-Step Flow
+
+```
+Browser/curl
+    │
+    │  POST /commands (JSON body)
+    ▼
+[cmd/actors/command/main.go]
+    │  startService() mounts the router at "/"
+    │  → mux.Handle("/", commandRouter)
+    ▼
+[pkg/resources/commands.go]  runCommand()
+    │
+    ├─ Step 1-5: Same as diagnosis actor
+    │             (deserialize → registry lookup → typed struct → callbacks → publish)
+    │             BUT publishes to "command-validated-requests" subject
+    │             AND wraps in CommandRequest envelope (not DiagnosisRequest)
+    │
+    ├─ Step 6: Wait (up to 40 MINUTES) for a response  ← big difference!
+    │
+    │  [Meanwhile, on the NATS message bus...]
+    ▼
+[pkg/fixtures/commands/commands.go]  Pipeline
+    │  Listening on NATS DefaultSubject
+    │  Matches message type → routes to commands.NeReboot()
+    ▼
+[pkg/fixtures/commands/ne_reboot.go]  NeReboot()  →  rebootDeviceSync()
+    │
+    ├─ Validate sourceObjectClass == "NetworkElement"
+    ├─ Validate sourceObjectType is a supported switch type
+    ├─ Fetch network element from inventory
+    ├─ Get management IP + full metadata (MatNumber, Hostname, NeConfigID...)
+    ├─ Call switchClient.Reboot()  ← actual Juniper API call
+    │
+    │  *** EXTRA: Post-reboot monitoring loop ***
+    │
+    ├─ PerformPing() — Shutdown verification loop
+    │     Pings every 10s for up to 2 minutes
+    │     Waits until device STOPS responding (confirms it shut down)
+    │     Produces CommandProcessingProgress events to Kafka
+    │
+    ├─ PerformPing() — Bootup verification loop
+    │     Pings every 30s for up to 30 minutes
+    │     Waits until device STARTS responding again (confirms it rebooted)
+    │     Produces CommandProcessingProgress events to Kafka
+    │
+    └─ ProduceNeRebootCommandResponse()
+         Produces final CommandResponse to Kafka
+    │
+    ▼
+Pipeline publishes CommandResponse to "command-responses"
+    │
+    ▼
+newCommandEmit() response listener receives it
+    │  Unwraps envelope → calls sendCommand() callback
+    ▼
+sendCommand() writes HTTP response back to caller
+    │
+    └─ 200 OK: {"id": "...", "responseData": {"summary": "...", "details": "..."}}
+```
+
+---
+
+### 3. Key Code in `commands.go`
+
+```go
+// The JSON request body shape
+type commandRequest struct {
+    CommandType                     string          `json:"commandType"`
+    CommandDataSpecificationVersion int             `json:"commandDataSpecificationVersion"`
+    CommandParameters               json.RawMessage `json:"commandParameters"`
+    Metadata                        Metadata        `json:"metadata"`
+}
+
+// Route registration
+r.HandleFunc("/commands", c.runCommand)
+
+// Response shape on success
+{
+  "id": "<notification-uuid>",
+  "responseData": { "summary": "...", "details": "..." }
+}
+```
+
+---
+
+## ⚖️ Differences: Diagnosis vs Command
+
+| Aspect | Diagnosis Actor | Command Actor |
+|---|---|---|
+| **Purpose** | Diagnostics + fire-and-return operations (includes reboot trigger) | Device operations with active post-operation monitoring |
+| **Endpoint** | `POST /diagnoses` | `POST /commands` |
+| **Request field** | `diagnosisType` / `diagnosisParameters` | `commandType` / `commandParameters` |
+| **NATS subject (request)** | `diagnosis-validated-requests` | `command-validated-requests` |
+| **NATS subject (response)** | `diagnosis-responses` | `command-responses` |
+| **Message envelope** | `DiagnosisRequest` / `DiagnosisResponse` | `CommandRequest` / `CommandResponse` |
+| **Output sink** | NATS | **Kafka** |
+| **HTTP timeout** | 60 seconds | **40 minutes** |
+| **Post-operation monitoring** | ❌ None — fire and return | ✅ Ping loops (shutdown + bootup) |
+| **Progress events** | ❌ None | ✅ `CommandProcessingProgress`, `CommandProcessingFailed`, `CommandProcessingFinished` |
+| **Response has return code** | ✅ `returnCode.code` (`OK`, `BAD_REQUEST`, etc.) | ❌ Just `summary` + `details` |
+| **Metadata richness** | Minimal (`NeId`, `IP`) | Full (`MatNumber`, `Hostname`, `NeType`, `NeConfigID`, ...) |
+
+---
+
+## 🆕 Changes Made in This Implementation
+
+### Problem Before the Changes
+
+The command actor **had no HTTP endpoint** to trigger operations. It only had:
+```
+GET /healthz  → Kubernetes liveness probe
+GET /readyz   → Kubernetes readiness probe
+```
+The only way to trigger a command was to publish a message directly onto the NATS bus — not practical for testing or direct integration.
+
+---
+
+### Change 1: New file `pkg/resources/commands.go`
+
+Created a new REST resource file (mirroring `diagnoses.go`) with:
+
+| Function | What it does |
+|---|---|
+| `BindCommandHandler()` | Creates a Gorilla mux router with the `POST /commands` route registered |
+| `runCommand()` | HTTP handler — deserializes request, sets up callbacks, publishes to NATS, waits for response |
+| `newCommandEmit()` | Publishes a `CommandRequest` to NATS and wires up request/response correlation |
+| `mergeWithDefaults()` | Merges user params with zero-value defaults so missing enum fields don't fail (see bug below) |
+| `createCommandResponse()` | Formats the response JSON sent back to the HTTP client |
+
+---
+
+### Change 2: Updated `cmd/actors/command/main.go`
+
+**Before:**
+```go
+func startService(logger loggingAPI.Logger) {
+    mux := http.NewServeMux()
+    mux.HandleFunc("/healthz", ...)
+    mux.HandleFunc("/readyz", ...)
+    // No business endpoints
+}
+```
+
+**After:**
+```go
+func startService(logger loggingAPI.Logger, commandCommands *commands.Commands) {
+    commandRouter := resources.BindCommandHandler(commandCommands)  // ← new
+
+    mux := http.NewServeMux()
+    mux.HandleFunc("/healthz", ...)
+    mux.HandleFunc("/readyz", ...)
+    mux.Handle("/", commandRouter)  // ← mounts /commands route
+}
+```
+
+Also added initialization of shared services and `commands.Commands` in `main()`.
+
+---
+
+### Bug Encountered & Fixed: Missing `rebootMode` Field
+
+**What happened:**
+```bash
+curl -X POST .../commands -d '{"commandType":"...NeRebootCommandRequest", "commandParameters":{"resourceId":"..."}}'
+# Response: {"message":"failed to deserialize command parameters"}
+```
+
+**Why it failed:**
+
+The generated Avro code has a **strict** JSON unmarshaller — it errors if ANY field is absent:
+```go
+// Generated code in ne_reboot_command_request.go
+if val != nil {
+    json.Unmarshal(val, &r.RebootMode)
+} else {
+    return fmt.Errorf("no value specified for rebootMode")  // ← strict!
+}
+```
+
+Go's normal JSON unmarshalling would silently use the zero value. But Avro-generated code does not.
+
+**The fix — `mergeWithDefaults()`:**
+
+1. Get a zero-value instance of the target type using `schemas.GetEmptyInstance()`
+2. Marshal it to JSON → `{"resourceId":"", "rebootMode":"DEFAULT"}`
+3. Overlay the user's params on top
+4. Deserialize the merged JSON → all required fields are now present
+
+```
+User sends:          {"resourceId": "abc123"}
+Zero-value defaults: {"resourceId": "", "rebootMode": "DEFAULT"}
+After merge:         {"resourceId": "abc123", "rebootMode": "DEFAULT"}  ✅
+```
+
+This is generic — works for any command type, not just NeReboot.
+
+---
+
+## 📋 Required Fields Per Command Type
+
+### `NeRebootCommandRequest`
+
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `resourceId` | string | ✅ Yes | — | UUID of the network element |
+| `rebootMode` | enum | ✅ Yes | `"DEFAULT"` | One of: `"DEFAULT"`, `"ONIE_BOOT"`, `"FIRMWARE_UPDATE"` |
+
+### `NepResetRequest`
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | string | ✅ Yes | UUID of the network element port (NEP) |
+
+---
+
+## 💡 Summary in Plain English
+
+> **Diagnosis actor** handles both read-only checks (ping, BGP state, interface counters) and some device operations like reboot. But it works in a **fire-and-return** style — it triggers the operation, gets an immediate success/failure answer, and returns. It does not monitor what happens after.
+
+> **Command actor** is for operations where you need to **track the outcome**. For a reboot, it triggers the reboot, then actively pings the device to confirm it shut down and came back online — this can take up to 30 minutes. During that time, it sends progress updates to Kafka so other systems know what's happening.
+
+Both work the same way at the HTTP layer — you POST a JSON request, and you get a JSON response. The complexity is all hidden inside the actor pipeline.
+
+---
+
+## 🔎 Deep Dive: How `POST /commands` NeReboot Works from Start to End
+
+This is a **complete, detailed walkthrough** of what happens when you run this curl command. Every step, every file, every layer — explained simply.
+
+### The curl command
+
+```bash
+curl -X POST http://localhost:9081/commands \
+  -H "Content-Type: application/json" \
+  -d '{
+    "commandType": "io.leitstand.actor.events.commands.NeRebootCommandRequest",
+    "commandParameters": {
+      "resourceId": "91000000-0080-0000-0103-000000000000",
+      "rebootMode": "DEFAULT"
+    },
+    "metadata": {
+      "sourceObjectIdentifier": "91000000-0080-0000-0103-000000000000",
+      "sourceObjectClass": "NetworkElement",
+      "sourceObjectType": "A4-SPINE-Switch-v2"
+    }
+  }'
+```
+
+---
+
+### Phase 1: HTTP Server Receives the Request
+
+**File:** `cmd/actors/command/main.go`
+
+When the command actor starts, `main()` does these things in order:
+
+```
+main()
+  ├─ Start health service (internal readiness tracking)
+  ├─ Initialize shared services (inventory client, switch client)
+  ├─ Create Commands struct (holds references to inventory + switch clients)
+  ├─ Create and start the command pipeline (listens on Kafka for messages)
+  └─ Start HTTP server in a goroutine → startService(logger, commandCommands)
+```
+
+`startService()` creates the HTTP server on port 8766 (or 9081 via Docker port mapping):
+
+```go
+commandRouter := resources.BindCommandHandler(commandCommands)  // creates /commands route
+
+mux := http.NewServeMux()
+mux.HandleFunc("/healthz", ...)     // K8s liveness
+mux.HandleFunc("/readyz", ...)      // K8s readiness
+mux.Handle("/", commandRouter)      // ALL other routes go to Gorilla mux router
+```
+
+When the curl arrives at `/commands`, Go's `ServeMux` doesn't match `/healthz` or `/readyz`, so it falls through to `mux.Handle("/", commandRouter)`. The Gorilla mux router matches `/commands` and calls `runCommand()`.
+
+---
+
+### Phase 2: Deserialize the HTTP JSON Body
+
+**File:** `pkg/resources/commands.go` → `runCommand()`
+
+The JSON body is decoded into the `commandRequest` struct:
+
+```go
+type commandRequest struct {
+    CommandType                     string          `json:"commandType"`
+    CommandDataSpecificationVersion int             `json:"commandDataSpecificationVersion"`
+    CommandParameters               json.RawMessage `json:"commandParameters"`
+    Metadata                        Metadata        `json:"metadata"`
+}
+```
+
+After decoding:
+- `req.CommandType` = `"io.leitstand.actor.events.commands.NeRebootCommandRequest"`
+- `req.CommandParameters` = raw JSON bytes `{"resourceId":"91000000-...","rebootMode":"DEFAULT"}`
+- `req.Metadata.SourceObjectIdentifier` = `"91000000-..."`
+- `req.Metadata.SourceObjectClass` = `"NetworkElement"`
+- `req.Metadata.SourceObjectType` = `"A4-SPINE-Switch-v2"`
+
+**Important:** `CommandParameters` is `json.RawMessage` — it stays as raw bytes at this point. We haven't tried to understand what's inside it yet.
+
+---
+
+### Phase 3: Schema Registry Lookup
+
+```go
+registry := schemas.NewDefaultRegistry()
+descriptor, err := registry.GetDescriptor(req.CommandType, req.CommandDataSpecificationVersion)
+```
+
+The **schema registry** is a big map that knows about every event type in the system. Given the string `"io.leitstand.actor.events.commands.NeRebootCommandRequest"`, it returns a `descriptor` containing:
+- A **serializer** function (Go struct → Avro binary)
+- A **deserializer** function (Avro binary → Go struct)
+- A **JSON deserializer** function (JSON → Go struct)
+- The event enum identifier
+
+Think of the registry as a phone book: you give it a name, and it tells you how to read/write that type.
+
+---
+
+### Phase 4: Deserialize `commandParameters` into a Typed Go Struct
+
+```go
+deserializer, _ := schemas.GetDeserializerJSON(descriptor.Event)
+v, _ := deserializer(*bytes.NewBuffer(req.CommandParameters))
+// v is now *commands.NeRebootCommandRequest{ResourceId: "91000000-...", RebootMode: 0}
+```
+
+This turns the raw JSON `{"resourceId":"...", "rebootMode":"DEFAULT"}` into a real Go struct:
+
+```go
+// Generated struct in pod-events.git
+type NeRebootCommandRequest struct {
+    ResourceId string     `json:"resourceId"`    // "91000000-..."
+    RebootMode RebootMode `json:"rebootMode"`    // RebootModeDEFAULT (0)
+}
+```
+
+**⚠️ Note:** The generated Avro JSON deserializer is **strict** — if you omit `rebootMode`, it fails with `"no value specified for rebootMode"`. That's why you must always include ALL fields.
+
+---
+
+### Phase 5: Set Up HTTP Response Callbacks
+
+Before publishing anything to Kafka, we create two functions that will be called later when a response arrives:
+
+```go
+done := make(chan bool)  // channel to signal "we got a response"
+
+sendCommand := func(ctx, m) {
+    // Called when the command succeeds
+    // Writes JSON response to the HTTP client
+    w.WriteHeader(200)
+    w.Write({"id": "...", "responseData": {...}})
+    done <- true  // signal: we're done, unblock the HTTP handler
+}
+
+sendError := func(ctx, msg) {
+    // Called when something goes wrong (timeout, actor not running)
+    // Writes 503 to the HTTP client
+    w.WriteHeader(503)
+    done <- true
+}
+```
+
+These callbacks are **closures** — they capture the `http.ResponseWriter` from the outer function, so they can write the HTTP response even though they'll be called from deep inside the framework.
+
+---
+
+### Phase 6: Publish to Kafka via `newCommandEmit()`
+
+**File:** `pkg/resources/commands.go` → `newCommandEmit()`
+
+This is where the message is packaged and sent to Kafka. Multiple layers of wrapping happen:
+
+#### Step 6a: Serialize the inner payload to Avro binary
+
+```go
+evtDesc.SerializerFunc(payload, &buf)
+// Input:  *NeRebootCommandRequest{ResourceId: "91000000-...", RebootMode: 0}
+// Output: binary Avro bytes in buf
+```
+
+#### Step 6b: Wrap in a CommandRequest envelope
+
+```go
+cmdEnvelope := &gen_cmd.CommandRequest{
+    CommandType:                          "...NeRebootCommandRequest",
+    NotificationDataSpecificationVersion: 1,
+    NotificationData:                     buf.Bytes(),  // the Avro binary from 6a
+}
+cmdEnvelope.Serialize(&bufEnvelope)  // serialize the envelope itself to Avro binary
+```
+
+This is **nested serialization**: the inner `NeRebootCommandRequest` is serialized, then stuffed into a `CommandRequest` envelope as raw bytes, and the whole thing is serialized again.
+
+#### Step 6c: Wrap in an ActorTaskEvent (the outermost wrapper)
+
+```go
+evt := util_events.CreateActorTaskEvent(
+    "io.leitstand.actor.events.commands.CommandRequest",  // type
+    1,                                                      // version
+    bufEnvelope.Bytes(),                                   // the envelope from 6b
+)
+```
+
+The `ActorTaskEvent` is the standard transport format. It adds:
+- `Metadata.SourceObjectIdentifier` = `"91000000-..."`
+- `Metadata.SourceObjectClass` = `"NetworkElement"`
+- `Metadata.SourceObjectType` = `"A4-SPINE-Switch-v2"`
+- `Metadata.TriggeringNotificationIds` = `["<unique-request-id>"]` (for correlating the response)
+
+#### Step 6d: Publish via GenericRequestResponseClient
+
+```go
+reqRespClient := pipelines.NewGenericRequestResponseClient()
+reqRespClient.Request(evt, onSuccess, onError, reqOptions, registry, sinkCfg)
+```
+
+This does TWO things simultaneously:
+
+1. **Creates a temporary response listener** — a mini-pipeline that subscribes to the `"command-responses"` Kafka topic and waits for a message whose `TriggeringNotificationIds[0]` matches our request ID. When it arrives, it calls our `sendCommand` callback.
+
+2. **Publishes the event** to the `"business-events-management"` Kafka topic (this is `api.DefaultSubject`).
+
+#### What's on the wire (Kafka message)
+
+```
+Topic: business-events-management
+Key: (none)
+Value: CloudEvent {
+    type: "io.leitstand.actor.events.commands.CommandRequest"
+    metadata: {
+        sourceObjectIdentifier: "91000000-..."
+        sourceObjectClass: "NetworkElement"
+        sourceObjectType: "A4-SPINE-Switch-v2"
+        triggeringNotificationIds: ["f160188c-39b1-..."]
+    }
+    data: CommandRequest {
+        commandType: "...NeRebootCommandRequest"
+        notificationDataSpecificationVersion: 1
+        notificationData: <avro binary of NeRebootCommandRequest>
+    }
+}
+```
+
+---
+
+### Phase 7: HTTP Handler Waits
+
+```go
+select {
+case <-time.After(40 * time.Minute):
+    // Timeout — write 504 and close
+    w.WriteHeader(http.StatusGatewayTimeout)
+    w.Write(`{"message":"command timed out waiting for a response"}`)
+case <-done:
+    // Response was already written by sendCommand or sendError callback
+}
+```
+
+The curl connection stays open. The HTTP handler goroutine is **blocked** here, waiting for either a callback to signal `done` or a 40-minute timeout.
+
+---
+
+### Phase 8: Command Pipeline Picks Up the Message
+
+**File:** `pkg/fixtures/commands/commands.go` → `CreatePipeline()`
+
+The command pipeline was started in `main()` and has been listening on Kafka this whole time. It was built like this:
+
+```go
+pipeline := pipelines.NewDefaultPipeline(input, sinkCfg).
+    On(schemas.NepResetRequest_1_1.GetName(), commands.NepReset).
+    On(schemas.NeRebootCommandRequest_1.GetName(), commands.NeReboot).
+    WithRegistries(schemas.NewDefaultRegistry()).
+    BuildCommandsPipeline()
+```
+
+`BuildCommandsPipeline()` creates a chain of processing layers:
+
+```
+Kafka Consumer (topic: "business-events-management")
+    │
+    ▼
+① RuntimeAwareLayer — sets up runtime context
+    │
+    ▼
+② InputLayer — reads Kafka messages
+    │
+    ▼
+③ ApiLayer — injects actor APIs (diagnosis client, command client, etc.)
+    │
+    ▼
+④ MeasureLayer — telemetry/timing
+    │
+    ▼
+⑤ AutoRecoveryLayer — crash recovery
+    │
+    ▼
+⑥ CloudEventPayloadDeserializer
+    │  Unwraps the CloudEvent wrapper
+    │  Extracts: type = "CommandRequest"
+    │  Deserializes binary → *commands.CommandRequest struct
+    │  Sets ctx.MessageType() = "...CommandRequest"
+    │
+    ▼
+⑦ CommandsRequestPayloadDeserializer  ← THE KEY LAYER
+    │  Sees: ctx.MessageType() == "CommandRequest" ✓
+    │  Reads: event.CommandType = "...NeRebootCommandRequest"
+    │  Reads: event.NotificationData = <avro binary>
+    │  Calls: ctx.SetMessageType("...NeRebootCommandRequest")  ← CHANGES the type
+    │  Calls: registry.GetDescriptor("...NeRebootCommandRequest", 1)
+    │  Calls: descriptor.DeserializerFunc(NotificationData)
+    │  Output: *commands.NeRebootCommandRequest{ResourceId: "91000000-...", RebootMode: 0}
+    │
+    ▼
+⑧ RouterLayer
+    │  Sees: ctx.MessageType() == "...NeRebootCommandRequest"
+    │  Matches: .On(schemas.NeRebootCommandRequest_1.GetName(), commands.NeReboot)
+    │  Calls: commands.NeReboot(ctx, *NeRebootCommandRequest{...})
+    │
+    ▼
+⑨ CloudEventSerializer — serializes outgoing responses
+    │
+    ▼
+⑩ SinkLayer — publishes responses to Kafka
+```
+
+**Layer ⑦ is crucial** — it does the "double unwrap". The outer CloudEvent had type `CommandRequest`. Inside that `CommandRequest` envelope, the `commandType` field says `NeRebootCommandRequest`. This layer extracts the inner payload, deserializes it, and changes the message type so the router can match it.
+
+**Layer ⑧ is the router** — it's a simple map: `{event type string → handler function}`. The `.On()` calls in `CreatePipeline()` populate this map.
+
+---
+
+### Phase 9: NeReboot Business Logic Executes
+
+**File:** `pkg/fixtures/commands/ne_reboot.go` → `NeReboot()` → `rebootDeviceSync()`
+
+Now the actual work begins:
+
+#### Step 9a: Validation
+
+```go
+sourceObjectClass := actorCtx.OriginalTask().Metadata.SourceObjectClass
+// Must be "NetworkElement" — reject otherwise
+
+sourceObjectType := actorCtx.OriginalTask().Metadata.SourceObjectType
+// Must be a valid spine/leaf/A10NSP switch type
+```
+
+#### Step 9b: Inventory Lookup
+
+```go
+networkElement, err := cmds.inventory.FetchFabricSwitch(actorCtx, notification.ResourceId)
+// Calls the inventory service API to get full details of this network element
+// Returns: NE name, management IP, material number, hostname, config ID, etc.
+```
+
+#### Step 9c: Get Management IP
+
+```go
+extended, _ := networkElement.GetExtendedData()
+mgmtIP, _ := inventory.ManagementIPAddress(extended)
+// e.g. mgmtIP = "10.1.2.3"
+```
+
+#### Step 9d: Build Metadata for Switch Client
+
+```go
+metadata := &store.Metadata{
+    MatNumber:  inventory.PlannedMatNumber(networkElement),
+    IP:         mgmtIP,            // "10.1.2.3"
+    NeType:     neName,            // e.g. "QFX5120-48Y"
+    Hostname:   hostname,          // e.g. "spine-01"
+    NeId:       networkElement.ID, // "91000000-..."
+    NeConfigID: neConfigID,
+}
+```
+
+#### Step 9e: Execute the Reboot
+
+```go
+switch notification.RebootMode {
+case commands.RebootModeFIRMWARE_UPDATE:
+    cmds.switchClient.Reboot(ctx, systemops.OnieUpdateMode, metadata, "")
+case commands.RebootModeONIE_BOOT:
+    cmds.switchClient.Reboot(ctx, systemops.OnieInstallMode, metadata, "")
+default:
+    cmds.switchClient.Reboot(ctx, systemops.NormalReboot, metadata, "")
+}
+```
+
+This calls the actual Juniper switch API (via NETCONF/REST) to tell the device to reboot.
+
+#### Step 9f: Progress Event — Reboot Triggered
+
+```go
+cmds.CommandProcessingProgress(actorCtx,
+    "SWITCH-C invoked QFX5120-48Y API to reboot",
+    "NE ID - 91000000-...")
+// → Produces a CommandProcessingProgress event to Kafka
+```
+
+---
+
+### Phase 10: Post-Reboot Ping Monitoring
+
+**File:** `pkg/fixtures/commands/ne_reboot.go` → `PerformPing()`
+
+This is what makes the command actor different from the diagnosis actor.
+
+#### Step 10a: Wait for Shutdown (up to 2 minutes)
+
+```
+PingShutDownLoop:
+  for time.Since(start) < 2 minutes {
+      sleep 10 seconds
+      _, err := switchClient.Ping(ctx, metadata)
+      if err == nil {
+          // Device still responding → not shut down yet
+          → Produce progress: "spine-01 is yet to shut down. Will probe again after 10 seconds"
+      } else {
+          // Device stopped responding → confirmed shutdown!
+          → Produce progress: "spine-01 is shut down, waiting for reboot"
+          break PingShutDownLoop
+      }
+  }
+  if not shut down after 2 min → FAIL
+```
+
+#### Step 10b: Wait for Bootup (up to 30 minutes)
+
+```
+PingBootUpLoop:
+  for time.Since(start) < 30 minutes {
+      sleep 30 seconds
+      _, err := switchClient.Ping(ctx, metadata)
+      if err != nil {
+          // Device still down → not booted yet
+          → Produce progress: "spine-01 is shut down yet to reboot. Will probe again after 30 seconds"
+      } else {
+          // Device responding again → confirmed bootup!
+          break PingBootUpLoop
+      }
+  }
+  if not booted after 30 min → FAIL
+```
+
+---
+
+### Phase 11: Produce the Final Response
+
+**File:** `pkg/fixtures/commands/ne_reboot.go` → `ProduceNeRebootCommandResponse()`
+
+On success:
+
+```go
+cmds.CommandProcessingFinished(actorCtx,
+    "QFX5120-48Y reboot completed. SWITCH-C restored communication with NE",
+    "Port Type - FABRIC")
+
+// Serializes NeRebootCommandResponse → wraps in CommandResponse envelope → publishes to Kafka
+actorCtx.Produce(&commands.CommandResponse{
+    CommandType:                          "...NeRebootCommandResponse",
+    NotificationDataSpecificationVersion: 1,
+    NotificationData:                     serializedResponseBytes,
+})
+```
+
+This goes back out through layers ⑨ (CloudEventSerializer) and ⑩ (SinkLayer) → published to `"command-responses"` Kafka topic.
+
+---
+
+### Phase 12: Response Flows Back to HTTP Client
+
+Remember in Phase 6d, the `GenericRequestResponseClient` created a temporary pipeline listening on `"command-responses"`. It now:
+
+1. **Receives** the Kafka message on `"command-responses"`
+2. **Checks** `TriggeringNotificationIds[0]` matches our request ID ✓
+3. **Unwraps** the CloudEvent → `CommandResponse` → inner `NeRebootCommandResponse`
+4. **Calls** our `sendCommand` callback (from Phase 5)
+
+The callback:
+```go
+sendCommand := func(ctx, m) {
+    resp = {"responseData": {"summary": "SWITCH NE Reboot completed", "details": "Rebooted the network element successfully"}}
+    resp["id"] = ctx.OriginalTask().Metadata.NotificationId
+    w.WriteHeader(200)
+    w.Write(resp)
+    done <- true  // ← unblocks the select in Phase 7
+}
+```
+
+The `done <- true` unblocks the `select` in `runCommand()`, and the HTTP response is sent back to curl:
+
+```json
+{
+  "id": "8513b5ca-7b40-4b09-b40c-2dd885135c00",
+  "responseData": {
+    "summary": "SWITCH NE Reboot completed",
+    "details": "Rebooted the network element successfully"
+  }
+}
+```
+
+---
+
+### Complete Visual: Every Layer from Curl to Device and Back
+
+```
+ curl POST /commands
+   │
+   ▼
+ ┌──────────────────────────────────────────────────────────┐
+ │  cmd/actors/command/main.go                              │
+ │  HTTP Server (:8766)                                     │
+ │  mux.Handle("/", commandRouter)                          │
+ └──────────┬───────────────────────────────────────────────┘
+            │
+            ▼
+ ┌──────────────────────────────────────────────────────────┐
+ │  pkg/resources/commands.go                               │
+ │  runCommand()                                            │
+ │                                                          │
+ │  1. JSON → commandRequest struct                         │
+ │  2. Registry lookup by commandType string                │
+ │  3. JSON → *NeRebootCommandRequest struct                │
+ │  4. Create sendCommand/sendError callbacks               │
+ │  5. newCommandEmit() → publish to Kafka                  │
+ │  6. select { wait for done or 40min timeout }            │
+ └──────────┬──────────────────────────────────┬────────────┘
+            │ publish                          │ wait
+            ▼                                  │
+ ┌─────────────────────┐                       │
+ │  Kafka               │                       │
+ │  "business-events-   │                       │
+ │   management" topic  │                       │
+ └──────────┬──────────┘                       │
+            │                                  │
+            ▼                                  │
+ ┌──────────────────────────────────────┐      │
+ │  Command Pipeline (already running)  │      │
+ │                                      │      │
+ │  ⑥ CloudEventDeserializer           │      │
+ │     → unwrap CloudEvent              │      │
+ │  ⑦ CommandsRequestDeserializer      │      │
+ │     → unwrap CommandRequest          │      │
+ │     → deserialize NeRebootCommand    │      │
+ │     → set message type               │      │
+ │  ⑧ Router                           │      │
+ │     → match "NeRebootCommandRequest" │      │
+ │     → call commands.NeReboot()       │      │
+ └──────────┬───────────────────────────┘      │
+            │                                  │
+            ▼                                  │
+ ┌──────────────────────────────────────┐      │
+ │  pkg/fixtures/commands/ne_reboot.go  │      │
+ │                                      │      │
+ │  Validate metadata                   │      │
+ │  Fetch NE from inventory             │      │
+ │  Get management IP                   │      │
+ │  Call switchClient.Reboot() ─────────┼──►  Juniper Switch
+ │  PerformPing() shutdown loop         │      (NETCONF/REST)
+ │  PerformPing() bootup loop           │      │
+ │  ProduceNeRebootCommandResponse()    │      │
+ └──────────┬───────────────────────────┘      │
+            │                                  │
+            ▼                                  │
+ ┌─────────────────────┐                       │
+ │  Kafka               │                       │
+ │  "command-responses" │                       │
+ │  topic               │                       │
+ └──────────┬──────────┘                       │
+            │                                  │
+            ▼                                  │
+ ┌──────────────────────────────────────┐      │
+ │  Temporary Response Listener         │      │
+ │  (created by newCommandEmit)         │      │
+ │                                      │      │
+ │  Match request ID                    │      │
+ │  Unwrap CommandResponse envelope     │      │
+ │  Call sendCommand() callback ────────┼──────┘
+ │  → done <- true                      │   unblocks select
+ └──────────────────────────────────────┘
+            │
+            ▼
+ curl receives: 200 OK
+ {"id":"...","responseData":{"summary":"SWITCH NE Reboot completed",...}}
+```
+
+---
+
+### How the `commandType` String Maps to the Handler Function
+
+This is the "magic" that confuses newcomers. **No code in `commands.go` references `NeReboot()` directly.** The routing is entirely string-based:
+
+```
+You send:       "commandType": "io.leitstand.actor.events.commands.NeRebootCommandRequest"
+                                          │
+                                          │ same string
+                                          ▼
+Pipeline has:   .On(schemas.NeRebootCommandRequest_1.GetName(), commands.NeReboot)
+                         │                                            │
+                         │ evaluates to the same string               │ the function
+                         ▼                                            ▼
+                "io.leitstand.actor.events.commands.NeRebootCommandRequest"  →  commands.NeReboot()
+```
+
+The `schemas.NeRebootCommandRequest_1` is a constant in the pod-events library that evaluates to `"io.leitstand.actor.events.commands.NeRebootCommandRequest"`. The router simply does a map lookup: `handlers["io.leitstand.actor.events.commands.NeRebootCommandRequest"]` → `commands.NeReboot`.
+
+If you send a `commandType` that no `.On()` registered, the router has no match and the message is silently dropped (or sent to a dead-letter queue).
+
+---
+
+### Bugs That Were Found and Fixed
+
+| Bug | Symptom | Root Cause | Fix |
+|---|---|---|---|
+| **Topic mismatch** | Message published but pipeline never processes it | Published to `"command-validated-requests"` but pipeline listens on `"business-events-management"` | Changed `commandRequestSubject` to `api.DefaultSubject` |
+| **Empty reply on timeout** | `curl: (52) Empty reply from server` | The timeout branch in `select` didn't write any HTTP response | Added `504 Gateway Timeout` JSON response |
+| **JSON field name** | `commandParameters` always empty/nil | Struct had `json:"parameters"` but curl sent `"commandParameters"` | Fixed tag to `json:"commandParameters"` |
+| **Wrong sink type** | Response pipeline not working | Used `NatsSinkType` but command pipeline uses Kafka | Changed to `KafkaSinkType` |
