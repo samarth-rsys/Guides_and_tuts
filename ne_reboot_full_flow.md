@@ -822,3 +822,262 @@ and `"10G"` desired), the patch is skipped — preventing duplicate events.
 | **BEM** | Business Event Manager — handles alarm deduplication (prevents raising the same alarm twice) |
 | **pao-sha** | Shared library used by pao-switch-core for Kafka/NATS connectivity |
 | **pod-actor** | Pipeline framework library for event-driven microservices (input → handler → output) |
+
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    NE REBOOT FUNCTION CALL FLOW                     │
+│                  (leaf-switch21 / WLG1D4VS0000CP5)                  │
+└─────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 1: NE GOES DOWN (06:46:41Z)
+═══════════════════════════════════════════════════════════════════════
+
+  Adapter detects NE down
+       │
+       ▼
+  Kafka: ne-lost-indication-topic
+       │ (ConnectionState_CONNECTION_STATE_DOWN)
+       ▼
+  ┌─ internal/core/assurance/nereachabilityalarm.go ─────────────┐
+  │  neReachabilityAlarm.On(ctx, eventData)                      │
+  │    ├─ parseNeLostIndication(eventData)                       │
+  │    ├─ switchCore.GetInventoryClient()                        │
+  │    │    .FetchNetworkElementByZtpIdent(ctx, "WLG1D4VS0000CP5")│
+  │    ├─ validateNeForAlarm(ne)                                 │
+  │    └─ case CONNECTION_STATE_DOWN:                            │
+  │         └─ c.raiseAlarm(neID, hostname, neTypeName)          │
+  │              └─ Publishes NeReachabilityStateChange alarm    │
+  └──────────────────────────────────────────────────────────────┘
+       │
+       │  NOTE: nereachabilityalarm does NOT patch
+       │  operationalStateA4Local. It only raises alarms.
+       │
+       ▼
+  Meanwhile, pao-switch-core also sends:
+  ┌─ internal/core/startup.go (or similar) ──────────────────────┐
+  │  PatchOperationalData request → Kafka                        │
+  │    operationalStateA4Local = "FAILED"                        │
+  │    (fire-and-forget to pod-inventory)                        │
+  └──────────────────────────────────────────────────────────────┘
+       │
+       ▼
+  pod-inventory receives PatchOperationalData, applies it, publishes:
+       │
+       ▼
+  Kafka: business-events-management
+  ┌──────────────────────────────────────────────────────────────┐
+  │  offset 3204: IpAddressAssignmentFinished (06:46:41Z)       │
+  │  offset 3205: StartupStarted (06:46:41Z)                    │
+  │  offset 3206: PatchOperationalDataSuccess FAILED (06:47:06Z)│ ← from pod-inventory
+  │  offset 3207: PatchOperationalDataSuccess FAILED (06:47:06Z)│ ← DUPLICATE (~64ms later)
+  └──────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 2: OBJECTCHANGED (06:47:06Z)
+═══════════════════════════════════════════════════════════════════════
+
+  pod-inventory publishes ObjectChanged after patching opData
+       │
+       ▼
+  Kafka: inventory.logical.default [offset 5241]
+       │ (operationalStateA4Local: WORKING → FAILED)
+       │ (dhcpOptionsMaps also changed)
+       ▼
+  ┌─ internal/core/assurance/events.go:304 ──────────────────────┐
+  │  ObjectChanged received: id=00001801-...000021               │
+  │    type=A4-LEAF-Switch-v2 class=NetworkElement               │
+  └──────────────────────────────────────────────────────────────┘
+       │
+       ▼
+  ┌─ internal/core/assurance/objectchanged.go:376 ───────────────┐
+  │  ObjectChanged processing: id=...021 class=NetworkElement    │
+  │    │                                                         │
+  │    ├─ assurance/utils.go:124                                 │
+  │    │    opData changed: dhcpOptionsMaps (new vs old)         │
+  │    │    opData changed: operationalStateA4Local              │
+  │    │                    new=FAILED old=WORKING               │
+  │    │                                                         │
+  │    ├─ objectchanged.go:385                                   │
+  │    │    changed attrs = [dhcpOptionsMaps,                    │
+  │    │                     operationalStateA4Local]            │
+  │    │                                                         │
+  │    ├─ assurance/blacklist.go:134                              │
+  │    │    "Blacklisted change for element type NetworkElement"  │
+  │    │    (both dhcpOptionsMaps & operationalStateA4Local       │
+  │    │     are blacklisted)                                    │
+  │    │                                                         │
+  │    └─ objectchanged.go:191                                   │
+  │         "ObjectChanged skipped: no relevant attributes       │
+  │          changed" → bringup=false, update=false              │
+  └──────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 3: NE COMES BACK UP (06:47:14Z)
+═══════════════════════════════════════════════════════════════════════
+
+  Adapter detects NE is up, sends SystemUpIndication
+       │
+       ▼
+  Kafka: systemup-indication-topic [offset 26]
+       │ {"serial_number":"WLG1D4VS0000CP5"}
+       ▼
+  ┌─ internal/core/assurance/systemupindicator.go ───────────────┐
+  │  systemUpIndicator.On(ctx, eventData)                        │
+  │    │                                                         │
+  │    ├─ protojson.Unmarshal → SystemUpIndication               │
+  │    │    ztpIdent = "WLG1D4VS0000CP5"                         │
+  │    │                                                         │
+  │    ├─ switchCore.GetInventoryClient()                        │
+  │    │    .FetchNetworkElementByZtpIdent(ctx, ztpIdent)        │
+  │    │    → neID = "00001801-0000-4c45-4146-000000000021"      │
+  │    │    → category = "LEAF_SWITCH"                           │
+  │    │                                                         │
+  │    ├─ inventory.IsRelevant("LEAF_SWITCH") → true             │
+  │    │                                                         │
+  │    └─ switchCore.GetArtefactUpdateClient().EphProducer       │
+  │         .Produce(ctx, schemas.NeStartupConfigLoaded_1, ...)  │
+  │         → Kafka: business-events-management [offset 3208]    │
+  │                                                              │
+  │    LOG: "SystemUpIndication: produced                        │
+  │          NeStartupConfigLoaded(WLG1D4VS0000CP5/...021)"      │
+  └──────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 4: NeStartupConfigLoaded CONSUMED (06:47:14Z)
+═══════════════════════════════════════════════════════════════════════
+
+  pao-switch-core consumes its own NeStartupConfigLoaded from BEM
+       │
+       ▼
+  Kafka: business-events-management [offset 3208]
+       │
+       ▼
+  ┌─ internal/core/artefactupdate/consumers/                     │
+  │  nestartupconfigloaded_update.go ────────────────────────────┐
+  │  ArtefactUpdateConsumer.HandleStartUpConfigLoadedUpdateEvent  │
+  │    │                                                         │
+  │    ├─ go c.consumeHandle(ctx, msg)  ← async goroutine       │
+  │    │    │                                                    │
+  │    │    ├─ type assert → *NeStartupConfigLoaded              │
+  │    │    └─ "no action" (comment: StartupFinished will be     │
+  │    │        emitted based on RunningConfigStatusInd)          │
+  │    │                                                         │
+  │    └─ return nil, nil                                        │
+  └──────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 5: RunningConfigStatusInd (from adapter via Proto Bus)
+═══════════════════════════════════════════════════════════════════════
+
+  Adapter sends RunningConfigStatusInd after config push
+       │
+       ▼
+  Kafka: running-config-status-indication-topic
+       │
+       ▼
+  ┌─ internal/core/assurance/runningconfigind.go ────────────────┐
+  │  runningConfigStatusIndicator.On(ctx, eventData)             │
+  │    │                                                         │
+  │    ├─ protojson.Unmarshal → RunningConfigStatusInd           │
+  │    │    serial = "WLG1D4VS0000CP5"                           │
+  │    │    reason = STARTUP (or similar)                        │
+  │    │    code   = OK                                          │
+  │    │                                                         │
+  │    ├─ getResourceFromZtpIdent(ctx, serial)                   │
+  │    │    → resolves NE from inventory                         │
+  │    │                                                         │
+  │    ├─ emitRunningConfigPushed(ctx, ind, res)                 │
+  │    │    → Produces RunningConfigPushed event                 │
+  │    │                                                         │
+  │    └─ emitFollowUpEvents(ctx, ind, res, codeStr, event)      │
+  │         │                                                    │
+  │         ├─ followUpHandlers[STARTUP]                         │
+  │         │                                                    │
+  │         └─ emitStartupIndication(ctx, ind, res, codeOK, ...) │
+  │              │                                               │
+  │              ├─ inventory.ExtractNeDetails(res)               │
+  │              │                                                │
+  │              ├─ (code == OK) →                               │
+  │              │    switchCore.EmitStartupFinished(             │
+  │              │      actorCtx, neID, atType,                  │
+  │              │      hostname, neTypeName,                    │
+  │              │      "device ready for service", "")          │
+  │              │                                               │
+  │              └─ (code != OK) →                               │
+  │                   switchCore.EmitNeStartupFailedEvents(...)   │
+  └──────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 6: StartupFinished EMITTED & CONSUMED (06:47:16Z)
+═══════════════════════════════════════════════════════════════════════
+
+  ┌─ internal/core/core.go:607 ─────────────────────────────────┐
+  │  SwitchCore.EmitStartupFinished(ctx, id, ...)               │
+  │    │                                                         │
+  │    ├─ startupFinished := management.StartupFinished{Id: id}  │
+  │    └─ ephProducer.Produce(ctx,                               │
+  │         schemas.StartupFinished_1, startupFinished, ...)     │
+  │         → Kafka: business-events-management [offset 3209]    │
+  └──────────────────────────────────────────────────────────────┘
+       │
+       ▼
+  pao-switch-core consumes StartupFinished from BEM [offset 3209]
+       │
+       ▼
+  ┌─ internal/core/artefactupdate/consumers/                     │
+  │  startupfinishedconsumer.go ─────────────────────────────────┐
+  │  ArtefactUpdateConsumer.HandleStartupFinishedEvent(ctx, msg) │
+  │    │                                                         │
+  │    ├─ resolveStartupFinishedNE(trCtx, msg, ev, start)        │
+  │    │    ├─ type assert → *management.StartupFinished         │
+  │    │    ├─ id = "00001801-0000-4c45-4146-000000000021"       │
+  │    │    └─ FetchNEDetails(ctx, id) → ne                      │
+  │    │                                                         │
+  │    └─ collectStartupTaskResults(ctx, trCtx, ne)              │
+  │         │                                                    │
+  │         ├─ goroutine 1: clearStartupFailedAlarm(ne)          │
+  │         │    └─ EmitNeStartUpFailedAlarm(severity=INFO)      │
+  │         │                                                    │
+  │         ├─ goroutine 2: restoreSubscriberResults(ctx, ne)    │
+  │         │    └─ reconciliation client restore                │
+  │         │                                                    │
+  │         └─ (if A10NSP): updateStartupTimeResult(trCtx, neID)│
+  └──────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 7: PatchOperationalDataSuccess WORKING (06:47:16Z, 06:48:44Z)
+═══════════════════════════════════════════════════════════════════════
+
+  pod-inventory patches operationalStateA4Local → WORKING
+  (triggered by StartupFinished or reconciliation)
+       │
+       ▼
+  Kafka: business-events-management
+  ┌──────────────────────────────────────────────────────────────┐
+  │  offset 3210: PatchOperationalDataSuccess WORKING (06:47:16Z)│
+  │  offset 3211: PatchOperationalDataSuccess WORKING (06:48:44Z)│
+  │               (88s later — separate reconciliation flow)     │
+  └──────────────────────────────────────────────────────────────┘
+       │
+       ▼
+  pao-switch-core: "not registered. Dropping!" (no handler)
+
+
+═══════════════════════════════════════════════════════════════════════
+PHASE 8: POST-STARTUP EVENTS
+═══════════════════════════════════════════════════════════════════════
+
+  offset 35354-35357: NepFlappingInterfaceAlarm (spine ports flapping
+                      due to leaf reboot)
+  offset 4949-4951:   PortStateChange_1_3 (ports going down/up)
+                      → portstatechangealarm.go processes these
+  
+  HTTP calls:  getVLANConfigHandler, GetL2XEndpoints, GetL2Bsa
+               → adapter queries for config reconciliation
