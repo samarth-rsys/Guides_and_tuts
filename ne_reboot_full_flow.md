@@ -823,7 +823,7 @@ and `"10G"` desired), the patch is skipped — preventing duplicate events.
 | **pao-sha** | Shared library used by pao-switch-core for Kafka/NATS connectivity |
 | **pod-actor** | Pipeline framework library for event-driven microservices (input → handler → output) |
 
-
+```text
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    NE REBOOT FUNCTION CALL FLOW                     │
 │                  (leaf-switch21 / WLG1D4VS0000CP5)                  │
