@@ -46,7 +46,7 @@ POD Servers typically host:
 
 The **Spine Switch** connects to POD Servers directly and needs to verify:
 1. The physical link is UP
-2. Neighbors (POD Servers) are discoverable
+2. Neighbors (POD Servers) are discoverable (RTBrick: neighbor entries with MAC are present)
 3. POD Servers are reachable via ping (loopback IP)
 
 ---
@@ -182,17 +182,22 @@ Spine NE
 
 ### Test 2: `testPODServerNeighbors`
 
-**Purpose:** Verify POD servers are discoverable by pinging their loopback IPs in the inband management VRF.
+**Purpose:** Verify POD servers are discoverable as neighbors.
 
-**Juniper Command Used:** `ping` (via `ExecutePingDiagnosis` API)
+**RTBrick API Used (reference):** `getNeighbors(...)` (neighbor/ARP-style discovery data)
+
+**Juniper Adaptation:** Uses `ping` (via `ExecutePingDiagnosis` API) as a proxy signal for neighbor/discovery health, because Juniper flow does not expose the same neighbor API shape used in RTBrick.
 
 **Algorithm:**
-1. Get metadata for the spine
-2. For each known POD server neConfigID (1, 2, 3):
-   - Compute the expected IP from `INBAND_MGMT_IP_PREFIX` + neConfigID offset
-   - Execute ping to that IP via the switch client
-   - Check if any responses were received
-3. Log overall PASSED/FAILED per discovered pod server hostname
+1. **RTBrick reference behavior**
+    - Fetch neighbors from RBFS (`getNeighbors`)
+    - Validate required instances (for example `inband_mgmt`, `olt_mgmt`, `dpu_mgmt`, `ip2`, `ancp_mgmt`)
+    - Ensure neighbor entries exist and each neighbor has a non-empty MAC address
+2. **Juniper implementation in this repo**
+    - For each known POD server neConfigID (1, 2, 3), compute destination IP in `inband_mgmt`
+    - Execute ping via switch client
+    - Mark discovery failed if no responses are received
+3. Log PASSED/FAILED per discovered POD server hostname
 
 ### Test 3: `testPODServerReachability`
 
