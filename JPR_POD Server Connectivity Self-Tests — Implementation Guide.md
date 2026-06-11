@@ -199,6 +199,46 @@ Spine NE
     - Mark discovery failed if no responses are received
 3. Log PASSED/FAILED per discovered POD server hostname
 
+#### PodServerNeighborsDiscovery: RTBrick vs Juniper (Very Easy)
+
+Think of both systems as checking: **"Do I see POD server neighbors?"**
+But they check it in different ways.
+
+##### RTBrick way (direct neighbor table check)
+
+- RTBrick first does explicit auth in this function (`prepareAuthorization`) to get token/port/protocol.
+- Then it calls `getNeighbors(...)` from RBFS.
+- It reads neighbor entries directly (like ARP/neighbor table data).
+- It verifies each required instance has neighbors and each neighbor has a MAC.
+
+Simple idea:
+
+```
+RTBrick asks: "Show me your neighbor list"
+Device shows table with MAC entries
+If table looks correct -> PASS
+```
+
+##### Juniper way (ping-based neighbor proof)
+
+- Juniper does **not** call `prepareAuthorization` in this test.
+- It builds `metadata` and uses `switchClient.ExecutePingDiagnosis(...)`.
+- Auth is handled internally by the shared HTTP client.
+- It computes POD server IPs from prefix + neConfigID and pings them.
+- If ping replies are received, it treats neighbor discovery as healthy.
+
+Simple idea:
+
+```
+Juniper asks: "Can I reach these POD server IPs by ping?"
+If ping replies come -> PASS
+```
+
+##### One-line difference
+
+- **RTBrick:** checks neighbor table entries directly.
+- **Juniper:** uses successful ping as practical proof of neighbor/connectivity health.
+
 ### Test 3: `testPODServerReachability`
 
 **Purpose:** Full bidirectional reachability test — ping from spine's own loopback to each POD server's loopback.
@@ -373,6 +413,102 @@ func (cmds *Commands) testPODServerReachability(...) bool { return true }
 
 ---
 
+## Understanding Nil SourceIP and 0 Interval (Simple Explanation)
+
+### The Problem with Nil SourceIP and 0 Interval
+
+When the Neighbor test pings a POD server, it creates a Ping object like this:
+
+```go
+pingReq := &models.Ping{
+    DestinationIP: net.ParseIP("192.168.16.1"),  // Where to ping
+    InstanceName:  "inband_mgmt",                // Which network (like an address book)
+    Count:         3,                             // Ping 3 times
+    Size:          56,                            // Packet size
+    SourceIP:      nil,                           // NOT SET ← This is intentional
+    Interval:      0,                             // NOT SET ← This is the default
+}
+```
+
+Think of it like **sending a letter**:
+
+- **DestinationIP** = Mailing address (required) ✓ Ping where?
+- **SourceIP** = Your return address (optional) → Sometimes you want to specify which of YOUR addresses to use, sometimes let the mail system pick
+- **Interval** = Wait time between letters (must be at least 1 second) → You can't send infinite letters instantly
+
+### Why SourceIP is Nil
+
+The **Neighbor test** doesn't care which spine interface sends the ping. It just wants to verify: **"Can the spine reach the POD server at all?"**
+
+Think of it like:
+```
+Spine: "I'll call the POD server from whatever phone is available"
+       (doesn't say "use office phone" or "use home phone")
+```
+
+The switch will automatically pick the right interface.
+
+BUT the **Reachability test** DOES specify source:
+
+```go
+pingReq := &models.Ping{
+    DestinationIP: net.ParseIP("192.168.16.1"),
+    SourceIP:      net.ParseIP("192.168.16.5"),   // ← Specific! "Use spine's IP"
+    InstanceName:  "inband_mgmt",
+    Count:         3,
+}
+```
+
+This asks: **"Can spine IP 192.168.16.5 reach POD server 192.168.16.1?"** (Bidirectional verification)
+
+### Why Interval was 0 Seconds
+
+When you create a Ping struct without setting Interval, Go defaults it to zero:
+
+```go
+pingReq := &models.Ping{...}  // Interval is time.Duration(0) by default
+```
+
+This becomes `0.000` in the Juniper ping command:
+
+```
+ping routing-instance inband_mgmt 192.168.16.1 count 3 interval 0.000 ← ❌ WRONG!
+```
+
+**Juniper doesn't accept `interval 0`** — you must wait at least 1 second between pings. You can't ping infinitely fast.
+
+Think of it like:
+```
+You: "Ping this server as fast as possible!"
+Juniper: "Sorry, I need at least 1 second between pings. I can't go faster."
+```
+
+### The Fix
+
+The code now handles both cases:
+
+```go
+// Only add "source X" if SourceIP is actually set
+if sourceIP != nil && sourceIP.String() != "" {
+    // Include source in command
+    command = "ping routing-instance inband_mgmt 192.168.16.1 source 192.168.16.5 count 3 interval 1.000"
+} else {
+    // Skip source if not needed
+    command = "ping routing-instance inband_mgmt 192.168.16.1 count 3 interval 1.000"
+}
+
+// Default interval to 1 second if not set
+if interval <= 0 {
+    interval = 1.0
+}
+```
+
+**Result:**
+- Neighbor test: `ping routing-instance inband_mgmt 192.168.16.1 count 3 interval 1.000` ✓ Clean, no nil
+- Reachability test: `ping routing-instance inband_mgmt 192.168.16.1 source 192.168.16.5 count 3 interval 1.000` ✓ Full test
+
+---
+
 ## Key Concepts for Newcomers
 
 ### 1. Network Element (NE)
@@ -424,6 +560,22 @@ The catalogue service provides this mapping based on the switch model (MatNumber
 | `INBAND_MGMT_IP_PREFIX` | CIDR for inband management IPs | `10.100.0.0/24` |
 | `OLT_MGMT_IP_PREFIX` | CIDR for OLT management IPs | `10.101.0.0/24` |
 | `DPU_MGMT_IP_PREFIX` | CIDR for DPU management IPs | `10.102.0.0/24` |
+
+#### Why these IP prefixes are required (very simple)
+
+Think of these prefixes as the **address blocks** from which test IPs are calculated.
+
+- The POD server tests know POD server IDs (`1`, `2`, `3`), not fixed full IPs.
+- So the code builds each target IP like:
+    - `INBAND_MGMT_IP_PREFIX` + `neConfigId`
+    - example: prefix `192.168.16.0/22` + ID `1` -> `192.168.16.1`
+
+Without these prefixes, the code does not know where to ping.
+
+- If the prefix is missing/empty, IP computation fails (parse error).
+- If the prefix is wrong, ping goes to wrong IPs and neighbor/reachability tests fail.
+
+In short: **Link test checks cable/interface state, but Neighbor/Reachability tests need IP prefixes to know the destination IPs.**
 
 ### 8. Test Concurrency
 
